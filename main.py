@@ -40,7 +40,7 @@ def validate_address(address):
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": address, "key": gkey}
     res = requests.get(url, params=params).json()
-    return res["status"] == "OK"
+    return res.get("status") == "OK"
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -73,8 +73,10 @@ def handle_message(event):
             state["time"] = dt.isoformat()
             user_states[user_id] = state
 
+            # 刪除舊紀錄
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
+            # 新增紀錄
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "origin": state["from"],
@@ -85,6 +87,7 @@ def handle_message(event):
                 "share_fare": None
             }).execute()
 
+            # 搜尋配對對象
             candidates = supabase.table("rides") \
                 .select("*") \
                 .eq("origin", state["from"]) \
@@ -108,18 +111,20 @@ def handle_message(event):
 
             if matched:
                 gkey = os.getenv("GOOGLE_API_KEY")
-                origin = state["from"]
-                destination = state["to"]
-                g_url = f"https://maps.googleapis.com/maps/api/distancematrix/json"
+                g_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
                 params = {
-                    "origins": origin,
-                    "destinations": destination,
+                    "origins": state["from"],
+                    "destinations": state["to"],
                     "key": gkey,
                     "mode": "driving",
                     "language": "zh-TW"
                 }
                 res = requests.get(g_url, params=params).json()
                 try:
+                    status = res["rows"][0]["elements"][0]["status"]
+                    if status != "OK":
+                        raise ValueError("無法取得距離")
+
                     meters = res["rows"][0]["elements"][0]["distance"]["value"]
                     km = meters / 1000
                     total_fare = max(25, int(km * 25))
@@ -152,13 +157,11 @@ def handle_message(event):
         if result.data:
             lines = []
             for r in result.data:
-                match = r.get("matched_user")
-                fare = r.get("share_fare")
                 s = f"{r['origin']} → {r['destination']} 時間: {r['time']}"
-                if match:
-                    s += f"\n👥 共乘對象：{match}"
-                if fare:
-                    s += f"\n💰 你需支付：${fare}"
+                if r.get("matched_user"):
+                    s += f"\n👥 共乘對象：{r['matched_user']}"
+                if r.get("share_fare"):
+                    s += f"\n💰 你需支付：${r['share_fare']}"
                 lines.append(s)
             reply = "📋 你的預約如下：\n" + "\n\n".join(lines)
         else:
