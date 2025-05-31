@@ -75,29 +75,36 @@ def handle_message(event):
             }
             supabase.table("rides").insert(data).execute()
 
-            # 查詢配對乘客
-            result = supabase.table("rides") \
-                .select("*") \
-                .eq("destination", state["to"]) \
-                .neq("user_id", user_id) \
-                .execute()
+            # 查詢配對乘客（含錯誤處理）
+            try:
+                result = supabase.table("rides") \
+                    .select("*") \
+                    .eq("destination", state["to"]) \
+                    .neq("user_id", user_id) \
+                    .execute()
 
-            matched = []
-            for r in result.data:
-                t1 = datetime.datetime.fromisoformat(state["time"])
-                t2 = datetime.datetime.fromisoformat(r["time"])
-                diff = abs((t1 - t2).total_seconds())
-                if diff <= 600:  # 10分鐘內
-                    matched.append(r)
+                matched = []
+                for r in result.data:
+                    try:
+                        t1 = datetime.datetime.fromisoformat(state["time"])
+                        t2 = datetime.datetime.fromisoformat(r["time"])
+                        diff = abs((t1 - t2).total_seconds())
+                        if diff <= 600:  # 10 分鐘內
+                            matched.append(r)
+                    except Exception:
+                        continue  # 有壞掉的時間就跳過
 
-            if matched:
-                match_lines = [
-                    f"🚕 乘客：{r['user_id'][-5:]}, 時間：{r['time'][11:16]}" for r in matched
-                ]
-                match_text = "\n".join(match_lines)
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n🧑‍🤝‍🧑 可共乘對象：\n{match_text}"
-            else:
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n目前暫無共乘對象。"
+                if matched:
+                    match_lines = [
+                        f"🚕 乘客：{r['user_id'][-5:]}, 時間：{r['time'][11:16]}" for r in matched
+                    ]
+                    match_text = "\n".join(match_lines)
+                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n🧑‍🤝‍🧑 可共乘對象：\n{match_text}"
+                else:
+                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n目前暫無共乘對象。"
+
+            except Exception as e:
+                reply = f"✅ 預約成功，但配對查詢失敗（可忽略）：{e}"
 
             user_states.pop(user_id)
 
