@@ -55,36 +55,38 @@ def handle_message(event):
         reply = "請輸入出發地點："
 
     elif state.get("step") == "from":
-        state["from"] = text
+        state["from"] = text.strip()
         state["step"] = "to"
         user_states[user_id] = state
         reply = "請輸入目的地點："
 
     elif state.get("step") == "to":
-        state["to"] = text
+        state["to"] = text.strip()
         state["step"] = "time"
         user_states[user_id] = state
         reply = "請輸入預約搭車時間（格式：2025-06-01 18:00）："
 
     elif state.get("step") == "time":
         try:
-            dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
+            dt = datetime.datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
             state["time"] = dt.isoformat()
 
             # 寫入 Supabase
             data = {
                 "user_id": user_id,
-                "origin": state["from"],
-                "destination": state["to"],
+                "origin": state["from"].strip(),
+                "destination": state["to"].strip(),
                 "time": state["time"]
             }
-            supabase.table("rides").insert(data).execute()
+            insert_result = supabase.table("rides").insert(data).execute()
+            print(f"[DEBUG] insert result: {insert_result}")
 
             # 查詢配對乘客（強化 debug）
             try:
                 result = supabase.table("rides") \
                     .select("*") \
-                    .eq("destination", state["to"]) \
+                    .eq("destination", state["to"].strip()) \
                     .neq("user_id", user_id) \
                     .execute()
 
