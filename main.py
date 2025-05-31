@@ -7,22 +7,16 @@ from supabase import create_client, Client
 import os
 import datetime
 
-# 載入 .env
 load_dotenv()
-
-# Flask 應用
 app = Flask(__name__)
 
-# 初始化 LINE Bot
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
-# 初始化 Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 使用者暫存狀態
 user_states = {}
 
 @app.route("/", methods=["GET"])
@@ -75,7 +69,7 @@ def handle_message(event):
             }
             supabase.table("rides").insert(data).execute()
 
-            # 查詢配對乘客（含錯誤處理）
+            # 查詢配對乘客（含除錯輸出）
             try:
                 result = supabase.table("rides") \
                     .select("*") \
@@ -84,27 +78,32 @@ def handle_message(event):
                     .execute()
 
                 matched = []
+                debug_lines = []
+
                 for r in result.data:
                     try:
                         t1 = datetime.datetime.fromisoformat(state["time"])
                         t2 = datetime.datetime.fromisoformat(r["time"])
                         diff = abs((t1 - t2).total_seconds())
-                        if diff <= 600:  # 10 分鐘內
+                        debug_lines.append(f"比較對象: {r['user_id'][-5:]}, 時間: {r['time'][11:16]}, 差距: {int(diff)}秒")
+                        if diff <= 600:
                             matched.append(r)
                     except Exception:
-                        continue  # 有壞掉的時間就跳過
+                        continue
 
                 if matched:
                     match_lines = [
                         f"🚕 乘客：{r['user_id'][-5:]}, 時間：{r['time'][11:16]}" for r in matched
                     ]
                     match_text = "\n".join(match_lines)
-                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n🧑‍🤝‍🧑 可共乘對象：\n{match_text}"
+                    debug_text = "\n".join(debug_lines)
+                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n🧑‍🤝‍🧑 可共乘對象：\n{match_text}\n\n[DEBUG]\n{debug_text}"
                 else:
-                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n目前暫無共乘對象。"
+                    debug_text = "\n".join(debug_lines)
+                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n目前暫無共乘對象。\n\n[DEBUG]\n{debug_text}"
 
             except Exception as e:
-                reply = f"✅ 預約成功，但配對查詢失敗（可忽略）：{e}"
+                reply = f"✅ 預約成功，但配對查詢失敗：{e}"
 
             user_states.pop(user_id)
 
