@@ -21,19 +21,19 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 user_states = {}
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=['GET'])
 def home():
     return "LINE Bot is running."
 
-@app.route("/callback", methods=["POST"])
+@app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers["X-Line-Signature"]
+    signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "OK"
+    return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -66,7 +66,7 @@ def handle_message(event):
             # 刪除舊資料
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
-            # 新增新預約
+            # 新增預約資料
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "origin": state["from"],
@@ -77,7 +77,7 @@ def handle_message(event):
                 "share_fare": None
             }).execute()
 
-            # 搜尋配對對象
+            # 尋找配對
             candidates = supabase.table("rides") \
                 .select("*") \
                 .eq("origin", state["from"]) \
@@ -92,42 +92,41 @@ def handle_message(event):
             for c in candidates.data:
                 try:
                     cand_time = datetime.datetime.fromisoformat(c["time"]).replace(tzinfo=None)
-                    delta = abs((cand_time - user_time).total_seconds())
-                    if delta <= 600:
+                    if abs((cand_time - user_time).total_seconds()) <= 600:
                         matched = c
                         break
                 except:
                     continue
 
             if matched:
-                # Google Maps API 距離查詢
-                gkey = os.getenv("GOOGLE_API_KEY")
-                g_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-                params = {
-                    "origins": state["from"],
-                    "destinations": state["to"],
-                    "key": gkey,
-                    "mode": "driving",
-                    "language": "zh-TW"
-                }
-
-                res = requests.get(g_url, params=params).json()
                 try:
-                    distance_data = res["rows"][0]["elements"][0]
-                    if distance_data["status"] != "OK":
-                        raise Exception(distance_data["status"])
-                    meters = distance_data["distance"]["value"]
-                    km = meters / 1000
-                    total_fare = max(25, int(km * 25))
+                    gkey = os.getenv("GOOGLE_API_KEY")
+                    g_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+                    params = {
+                        "origins": state["from"],
+                        "destinations": state["to"],
+                        "key": gkey,
+                        "mode": "driving",
+                        "language": "zh-TW"
+                    }
+                    res = requests.get(g_url, params=params)
+                    data = res.json()
+                    element = data["rows"][0]["elements"][0]
+
+                    if element["status"] != "OK":
+                        raise Exception(f"地點無效（{element['status']}）")
+
+                    meters = element["distance"]["value"]
+                    total_fare = max(25, int((meters / 1000) * 25))
+
                 except Exception as e:
-                    reply = f"❌ Google Maps 錯誤（{str(e)}）請重新輸入地點。"
+                    reply = f"❌ Google Maps 錯誤：{str(e)}，請重新輸入地點。"
                     user_states.pop(user_id, None)
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
                     return
 
                 share = total_fare // 2
 
-                # 更新配對雙方
                 supabase.table("rides").update({
                     "matched_user": matched["user_id"],
                     "fare": total_fare,
@@ -140,10 +139,16 @@ def handle_message(event):
                     "share_fare": share
                 }).eq("user_id", matched["user_id"]).execute()
 
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n🧑‍🤝‍🧑 成功配對！\n🚕 共乘對象：{matched['user_id']}\n💰 總費用：${total_fare}，你需支付：${share}"
+                reply = (
+                    f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n"
+                    f"🧑‍🤝‍🧑 成功配對！\n🚕 共乘對象：{matched['user_id']}\n"
+                    f"💰 總費用：${total_fare}，你需支付：${share}"
+                )
             else:
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n目前暫無共乘對象。"
-
+                reply = (
+                    f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n"
+                    "目前暫無共乘對象。"
+                )
             user_states.pop(user_id)
 
         except ValueError:
