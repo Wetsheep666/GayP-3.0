@@ -3,3 +3,4 @@ gunicorn
 psycopg2-binary
 python-dotenv
 line-bot-sdk
+supabase-py
