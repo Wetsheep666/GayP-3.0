@@ -1,20 +1,19 @@
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, LocationMessage, TextSendMessage
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import os
 import datetime
-import requests
+import math
 
-# 載入 .env
 load_dotenv()
-
-# 初始化
 app = Flask(__name__)
+
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -35,143 +34,104 @@ def callback():
         abort(400)
     return 'OK'
 
-def validate_address(address):
-    gkey = os.getenv("GOOGLE_API_KEY")
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": address, "key": gkey}
-    res = requests.get(url, params=params).json()
-    return res.get("status") == "OK"
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  # km
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat/2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dLon/2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
+def handle_text(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
     state = user_states.get(user_id, {})
 
     if text.lower() in ["預約", "我要搭車"]:
         user_states[user_id] = {"step": "from"}
-        reply = "請輸入出發地點："
-    elif state.get("step") == "from":
-        if not validate_address(text):
-            reply = "❌ 出發地點格式無效，請重新輸入："
-        else:
-            state["from"] = text
-            state["step"] = "to"
-            user_states[user_id] = state
-            reply = "請輸入目的地點："
-    elif state.get("step") == "to":
-        if not validate_address(text):
-            reply = "❌ 目的地點格式無效，請重新輸入："
-        else:
-            state["to"] = text
-            state["step"] = "time"
-            user_states[user_id] = state
-            reply = "請輸入預約搭車時間（格式：2025-06-01 18:00）："
+        reply = "📍 請傳送你的出發地點（點選 ➕ > 位置）："
     elif state.get("step") == "time":
         try:
             dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
             state["time"] = dt.isoformat()
-            user_states[user_id] = state
 
-            # 刪除舊紀錄
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
-            # 新增紀錄
             supabase.table("rides").insert({
                 "user_id": user_id,
-                "origin": state["from"],
-                "destination": state["to"],
+                "origin_lat": state["origin_lat"],
+                "origin_lng": state["origin_lng"],
+                "destination_lat": state["destination_lat"],
+                "destination_lng": state["destination_lng"],
                 "time": state["time"],
-                "matched_user": None,
-                "fare": None,
-                "share_fare": None
+                "matched_user": None
             }).execute()
 
-            # 搜尋配對對象
+            # 查找配對
             candidates = supabase.table("rides") \
                 .select("*") \
-                .eq("origin", state["from"]) \
-                .eq("destination", state["to"]) \
                 .is_("matched_user", None) \
                 .neq("user_id", user_id) \
                 .execute()
 
             matched = None
-            user_time = dt.replace(tzinfo=None)
-
             for c in candidates.data:
                 try:
-                    cand_time = datetime.datetime.fromisoformat(c["time"]).replace(tzinfo=None)
-                    delta = abs((cand_time - user_time).total_seconds())
-                    if delta <= 600:
+                    delta_time = abs((datetime.datetime.fromisoformat(c["time"]).replace(tzinfo=None) -
+                                      datetime.datetime.fromisoformat(state["time"]).replace(tzinfo=None)).total_seconds())
+                    if delta_time > 600:
+                        continue
+
+                    o_dist = haversine(state["origin_lat"], state["origin_lng"], c["origin_lat"], c["origin_lng"])
+                    d_dist = haversine(state["destination_lat"], state["destination_lng"], c["destination_lat"], c["destination_lng"])
+
+                    if o_dist < 1.0 and d_dist < 1.0:
                         matched = c
                         break
                 except:
                     continue
 
             if matched:
-                gkey = os.getenv("GOOGLE_API_KEY")
-                g_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-                params = {
-                    "origins": state["from"],
-                    "destinations": state["to"],
-                    "key": gkey,
-                    "mode": "driving",
-                    "language": "zh-TW"
-                }
-                res = requests.get(g_url, params=params).json()
-                try:
-                    status = res["rows"][0]["elements"][0]["status"]
-                    if status != "OK":
-                        raise ValueError("無法取得距離")
-
-                    meters = res["rows"][0]["elements"][0]["distance"]["value"]
-                    km = meters / 1000
-                    total_fare = max(25, int(km * 25))
-                    share = total_fare // 2
-                except:
-                    reply = "❌ Google Maps 錯誤：查無距離資訊，請重新輸入地點。"
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                    return
-
-                supabase.table("rides").update({
-                    "matched_user": matched["user_id"],
-                    "fare": total_fare,
-                    "share_fare": share
-                }).eq("user_id", user_id).execute()
-
-                supabase.table("rides").update({
-                    "matched_user": user_id,
-                    "fare": total_fare,
-                    "share_fare": share
-                }).eq("user_id", matched["user_id"]).execute()
-
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n🧑‍🤝‍🧑 成功配對！\n🚕 共乘對象：{matched['user_id']}\n💰 總費用：${total_fare}，你需支付：${share}"
+                supabase.table("rides").update({"matched_user": matched["user_id"]}).eq("user_id", user_id).execute()
+                supabase.table("rides").update({"matched_user": user_id}).eq("user_id", matched["user_id"]).execute()
+                reply = f"✅ 預約成功並成功配對！\n🧍‍♂️ 你與 {matched['user_id']} 共乘。\n🚕 預約時間：{dt.strftime('%H:%M')}"
             else:
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n目前暫無共乘對象。"
+                reply = f"✅ 預約成功！\n目前尚無共乘對象，已為你保留預約資訊。"
+
             user_states.pop(user_id)
         except ValueError:
             reply = "⚠️ 時間格式錯誤，請重新輸入（例如：2025-06-01 18:00）："
-    elif text.lower() in ["查詢", "查詢預約"]:
-        result = supabase.table("rides").select("*").eq("user_id", user_id).execute()
-        if result.data:
-            lines = []
-            for r in result.data:
-                s = f"{r['origin']} → {r['destination']} 時間: {r['time']}"
-                if r.get("matched_user"):
-                    s += f"\n👥 共乘對象：{r['matched_user']}"
-                if r.get("share_fare"):
-                    s += f"\n💰 你需支付：${r['share_fare']}"
-                lines.append(s)
-            reply = "📋 你的預約如下：\n" + "\n\n".join(lines)
-        else:
-            reply = "你目前沒有任何預約。"
     elif text.lower() in ["取消", "取消預約"]:
         supabase.table("rides").delete().eq("user_id", user_id).execute()
         user_states.pop(user_id, None)
-        reply = "🗑️ 所有預約已取消。"
+        reply = "🗑️ 已取消所有預約。"
     else:
-        reply = "請輸入「預約」、「查詢」或「取消」來使用共乘服務。"
+        reply = "請依序輸入或傳送地點：「預約」開始 ➡️ 出發地 ➡️ 目的地 ➡️ 預約時間（2025-06-01 18:00）"
+
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+@handler.add(MessageEvent, message=LocationMessage)
+def handle_location(event):
+    user_id = event.source.user_id
+    state = user_states.get(user_id, {})
+    lat = event.message.latitude
+    lng = event.message.longitude
+
+    if state.get("step") == "from":
+        state["origin_lat"] = lat
+        state["origin_lng"] = lng
+        state["step"] = "to"
+        user_states[user_id] = state
+        reply = "📍 請傳送你的目的地點（點選 ➕ > 位置）："
+    elif state.get("step") == "to":
+        state["destination_lat"] = lat
+        state["destination_lng"] = lng
+        state["step"] = "time"
+        user_states[user_id] = state
+        reply = "🕒 請輸入預約搭車時間（格式：2025-06-01 18:00）："
+    else:
+        reply = "請先輸入「預約」開始流程再傳送位置 📍"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
