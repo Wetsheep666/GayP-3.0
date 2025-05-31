@@ -7,32 +7,43 @@ from supabase import create_client, Client
 import os
 import datetime
 
+# 載入 .env 檔案
 load_dotenv()
+
+# 建立 Flask 應用
 app = Flask(__name__)
 
+# 初始化 LINE Bot API 和 WebhookHandler
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
+# 初始化 Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# 使用者暫存狀態
 user_states = {}
 
-@app.route("/", methods=["GET"])
+# 測試用 GET 路由
+@app.route("/", methods=['GET'])
 def home():
     return "LINE Bot is running."
 
-@app.route("/callback", methods=["POST"])
+# LINE Webhook 用 POST 路由
+@app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers["X-Line-Signature"]
+    signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "OK"
 
+    return 'OK'
+
+# 處理 LINE 使用者訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
@@ -69,7 +80,7 @@ def handle_message(event):
             }
             supabase.table("rides").insert(data).execute()
 
-            # 查詢配對乘客（含除錯輸出）
+            # 查詢配對乘客（強化 debug）
             try:
                 result = supabase.table("rides") \
                     .select("*") \
@@ -78,29 +89,27 @@ def handle_message(event):
                     .execute()
 
                 matched = []
-                debug_lines = []
+                debug_lines = [f"[DEBUG] 總共找到 {len(result.data)} 位乘客："]
 
                 for r in result.data:
                     try:
                         t1 = datetime.datetime.fromisoformat(state["time"])
                         t2 = datetime.datetime.fromisoformat(r["time"])
                         diff = abs((t1 - t2).total_seconds())
-                        debug_lines.append(f"比較對象: {r['user_id'][-5:]}, 時間: {r['time'][11:16]}, 差距: {int(diff)}秒")
+                        debug_lines.append(f"用戶 {r['user_id'][-5:]}, {r['origin']} → {r['destination']}, 時間: {r['time'][11:16]}, 差 {int(diff)}秒")
                         if diff <= 600:
                             matched.append(r)
-                    except Exception:
-                        continue
+                    except Exception as e:
+                        debug_lines.append(f"時間格式錯誤: {e}")
 
                 if matched:
                     match_lines = [
-                        f"🚕 乘客：{r['user_id'][-5:]}, 時間：{r['time'][11:16]}" for r in matched
+                        f"🚕 共乘對象：{r['user_id'][-5:]}, 時間：{r['time'][11:16]}" for r in matched
                     ]
                     match_text = "\n".join(match_lines)
-                    debug_text = "\n".join(debug_lines)
-                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n🧑‍🤝‍🧑 可共乘對象：\n{match_text}\n\n[DEBUG]\n{debug_text}"
+                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n🧑‍🤝‍🧑 成功配對：\n{match_text}\n\n" + "\n".join(debug_lines)
                 else:
-                    debug_text = "\n".join(debug_lines)
-                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n目前暫無共乘對象。\n\n[DEBUG]\n{debug_text}"
+                    reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n\n目前暫無共乘對象。\n\n" + "\n".join(debug_lines)
 
             except Exception as e:
                 reply = f"✅ 預約成功，但配對查詢失敗：{e}"
@@ -128,5 +137,6 @@ def handle_message(event):
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
+# Flask 本地啟動（Render 不會用到）
 if __name__ == "__main__":
     app.run()
