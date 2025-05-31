@@ -7,32 +7,29 @@ from supabase import create_client, Client
 import os
 import datetime
 
-# 載入 .env 設定
+# 初始化
 load_dotenv()
 app = Flask(__name__)
-
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 user_states = {}
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=['GET'])
 def home():
     return "LINE Bot is running."
 
-@app.route("/callback", methods=["POST"])
+@app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers["X-Line-Signature"]
+    signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "OK"
+
+    return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -59,51 +56,66 @@ def handle_message(event):
     elif state.get("step") == "time":
         try:
             dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
-            time_iso = dt.isoformat()
+            state["time"] = dt.isoformat()
             user_states[user_id] = state
 
-            # 儲存使用者資料
+            # 插入資料
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "origin": state["from"],
                 "destination": state["to"],
-                "time": time_iso,
-                "matched_user": None
+                "time": state["time"],
+                "matched_user": None,
+                "fare": None,
+                "share_fare": None
             }).execute()
 
-            # 查找其他尚未配對且時間相近的用戶
-            result = supabase.table("rides") \
+            # 尋找配對對象
+            res = supabase.table("rides") \
                 .select("*") \
                 .eq("origin", state["from"]) \
                 .eq("destination", state["to"]) \
-                .is_("matched_user", None) \
+                .eq("matched_user", None) \
                 .neq("user_id", user_id) \
                 .execute()
 
             match = None
-            debug = []
-
-            for r in result.data:
+            for r in res.data:
                 try:
                     r_time = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
-                    diff = abs((dt - r_time).total_seconds())
-                    debug.append(f"比對 {r['user_id'][-5:]}, 差 {int(diff)} 秒")
+                    diff = abs((dt.replace(tzinfo=None) - r_time).total_seconds())
                     if diff <= 600:
                         match = r
                         break
-                except Exception as e:
-                    debug.append(f"錯誤: {e}")
+                except:
+                    continue
 
             if match:
-                # 雙方寫入 matched_user
-                supabase.table("rides").update({"matched_user": match["user_id"]}).eq("user_id", user_id).execute()
-                supabase.table("rides").update({"matched_user": user_id}).eq("user_id", match["user_id"]).execute()
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n🚕 成功配對用戶：{match['user_id'][-5:]}"
-            else:
-                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n目前尚無共乘對象。"
+                total_fare = 200
+                share = total_fare // 2
 
-            if debug:
-                reply += "\n\n[DEBUG]\n" + "\n".join(debug)
+                supabase.table("rides").update({
+                    "matched_user": match["user_id"],
+                    "fare": total_fare,
+                    "share_fare": share
+                }).eq("user_id", user_id).execute()
+
+                supabase.table("rides").update({
+                    "matched_user": user_id,
+                    "fare": total_fare,
+                    "share_fare": share
+                }).eq("user_id", match["user_id"]).execute()
+
+                reply = (
+                    f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n"
+                    f"🚕 成功配對用戶：{match['user_id'][-5:]}\n"
+                    f"💰 每人預估費用：${share}"
+                )
+            else:
+                reply = (
+                    f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n"
+                    f"目前暫無共乘對象。"
+                )
 
             user_states.pop(user_id)
 
@@ -111,15 +123,17 @@ def handle_message(event):
             reply = "⚠️ 時間格式錯誤，請重新輸入（例如：2025-06-01 18:00）："
 
     elif text.lower() in ["查詢", "查詢預約"]:
-        result = supabase.table("rides").select("*").eq("user_id", user_id).execute()
-        if result.data:
-            ride = result.data[0]
-            time_str = ride["time"][11:16]
-            matched = ride.get("matched_user")
-            if matched:
-                reply = f"📋 你已預約：\n從 {ride['origin']} 到 {ride['destination']}，時間 {time_str}\n✅ 配對用戶：{matched[-5:]}"
-            else:
-                reply = f"📋 你已預約：\n從 {ride['origin']} 到 {ride['destination']}，時間 {time_str}\n尚未配對"
+        res = supabase.table("rides").select("*").eq("user_id", user_id).execute()
+        if res.data:
+            messages = []
+            for r in res.data:
+                m = f"{r['origin']} → {r['destination']} 時間: {r['time'][11:16]}"
+                if r.get("matched_user"):
+                    m += f"\n🧑‍🤝‍🧑 共乘對象：{r['matched_user'][-5:]}"
+                    if r.get("share_fare"):
+                        m += f"\n💰 分攤金額：${r['share_fare']}"
+                messages.append(m)
+            reply = "📋 你的預約如下：\n" + "\n\n".join(messages)
         else:
             reply = "你目前沒有任何預約。"
 
@@ -129,7 +143,7 @@ def handle_message(event):
         reply = "🗑️ 所有預約已取消。"
 
     else:
-        reply = "請輸入「預約」、「查詢」或「取消」來使用共乘服務。"
+        reply = "請輸入「預約」、「查詢」或「取消」來操作共乘服務。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
