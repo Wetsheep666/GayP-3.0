@@ -82,7 +82,7 @@ def handle_message(event):
             insert_result = supabase.table("rides").insert(data).execute()
             print(f"[DEBUG] insert result: {insert_result}")
 
-            # 查詢配對乘客（強化 debug）
+            # 查詢配對乘客（修正 datetime 比較）
             try:
                 result = supabase.table("rides") \
                     .select("*") \
@@ -95,8 +95,8 @@ def handle_message(event):
 
                 for r in result.data:
                     try:
-                        t1 = datetime.datetime.fromisoformat(state["time"])
-                        t2 = datetime.datetime.fromisoformat(r["time"])
+                        t1 = datetime.datetime.fromisoformat(state["time"]).replace(tzinfo=None)
+                        t2 = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
                         diff = abs((t1 - t2).total_seconds())
                         debug_lines.append(f"用戶 {r['user_id'][-5:]}, {r['origin']} → {r['destination']}, 時間: {r['time'][11:16]}, 差 {int(diff)}秒")
                         if diff <= 600:
