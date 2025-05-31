@@ -11,13 +11,13 @@ import requests
 # 載入 .env
 load_dotenv()
 
-# 初始化
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 user_states = {}
 
@@ -66,7 +66,7 @@ def handle_message(event):
             # 刪除舊資料
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
-            # 新增預約資料
+            # 新增預約
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "origin": state["from"],
@@ -77,7 +77,7 @@ def handle_message(event):
                 "share_fare": None
             }).execute()
 
-            # 尋找配對
+            # 查找配對候選
             candidates = supabase.table("rides") \
                 .select("*") \
                 .eq("origin", state["from"]) \
@@ -92,7 +92,8 @@ def handle_message(event):
             for c in candidates.data:
                 try:
                     cand_time = datetime.datetime.fromisoformat(c["time"]).replace(tzinfo=None)
-                    if abs((cand_time - user_time).total_seconds()) <= 600:
+                    delta = abs((cand_time - user_time).total_seconds())
+                    if delta <= 600:
                         matched = c
                         break
                 except:
@@ -100,25 +101,26 @@ def handle_message(event):
 
             if matched:
                 try:
-                    gkey = os.getenv("GOOGLE_API_KEY")
                     g_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
                     params = {
                         "origins": state["from"],
                         "destinations": state["to"],
-                        "key": gkey,
+                        "key": GOOGLE_API_KEY,
                         "mode": "driving",
                         "language": "zh-TW"
                     }
                     res = requests.get(g_url, params=params)
                     data = res.json()
+
+                    if res.status_code != 200:
+                        raise Exception("Google API 回應失敗")
+                    if not data.get("rows") or not data["rows"][0].get("elements"):
+                        raise Exception("查無距離資訊")
                     element = data["rows"][0]["elements"][0]
-
-                    if element["status"] != "OK":
-                        raise Exception(f"地點無效（{element['status']}）")
-
+                    if element.get("status") != "OK":
+                        raise Exception(f"地點無效（{element.get('status')}）")
                     meters = element["distance"]["value"]
                     total_fare = max(25, int((meters / 1000) * 25))
-
                 except Exception as e:
                     reply = f"❌ Google Maps 錯誤：{str(e)}，請重新輸入地點。"
                     user_states.pop(user_id, None)
@@ -139,16 +141,11 @@ def handle_message(event):
                     "share_fare": share
                 }).eq("user_id", matched["user_id"]).execute()
 
-                reply = (
-                    f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n"
-                    f"🧑‍🤝‍🧑 成功配對！\n🚕 共乘對象：{matched['user_id']}\n"
-                    f"💰 總費用：${total_fare}，你需支付：${share}"
-                )
+                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n🧑‍🤝‍🧑 成功配對！\n🚕 共乘對象：{matched['user_id']}\n💰 總費用：${total_fare}，你需支付：${share}"
+
             else:
-                reply = (
-                    f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n"
-                    "目前暫無共乘對象。"
-                )
+                reply = f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {dt.strftime('%H:%M')}\n\n目前暫無共乘對象。"
+
             user_states.pop(user_id)
 
         except ValueError:
@@ -159,11 +156,13 @@ def handle_message(event):
         if result.data:
             lines = []
             for r in result.data:
+                match = r.get("matched_user")
+                fare = r.get("share_fare")
                 s = f"{r['origin']} → {r['destination']} 時間: {r['time']}"
-                if r.get("matched_user"):
-                    s += f"\n👥 共乘對象：{r['matched_user']}"
-                if r.get("share_fare"):
-                    s += f"\n💰 你需支付：${r['share_fare']}"
+                if match:
+                    s += f"\n👥 共乘對象：{match}"
+                if fare:
+                    s += f"\n💰 你需支付：${fare}"
                 lines.append(s)
             reply = "📋 你的預約如下：\n" + "\n\n".join(lines)
         else:
