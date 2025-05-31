@@ -7,12 +7,17 @@ from supabase import create_client, Client
 import os
 import datetime
 
-# 初始化
 load_dotenv()
+
 app = Flask(__name__)
+
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 user_states = {}
 
 @app.route("/", methods=['GET'])
@@ -56,8 +61,12 @@ def handle_message(event):
     elif state.get("step") == "time":
         try:
             dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
+            dt = dt.replace(tzinfo=None)
             state["time"] = dt.isoformat()
             user_states[user_id] = state
+
+            # 刪除舊資料
+            supabase.table("rides").delete().eq("user_id", user_id).execute()
 
             # 插入資料
             supabase.table("rides").insert({
@@ -70,24 +79,20 @@ def handle_message(event):
                 "share_fare": None
             }).execute()
 
-            # 尋找配對對象
-            res = supabase.table("rides") \
-                .select("*") \
-                .eq("origin", state["from"]) \
-                .eq("destination", state["to"]) \
-                .eq("matched_user", None) \
-                .neq("user_id", user_id) \
-                .execute()
+            # 查找潛在共乘對象
+            result = supabase.table("rides").select("*") \
+                .eq("origin", state["from"]).eq("destination", state["to"]) \
+                .is_("matched_user", "null").neq("user_id", user_id).execute()
 
             match = None
-            for r in res.data:
+            for r in result.data:
                 try:
                     r_time = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
-                    diff = abs((dt.replace(tzinfo=None) - r_time).total_seconds())
+                    diff = abs((dt - r_time).total_seconds())
                     if diff <= 600:
                         match = r
                         break
-                except:
+                except Exception:
                     continue
 
             if match:
@@ -108,7 +113,7 @@ def handle_message(event):
 
                 reply = (
                     f"✅ 預約成功！\n從 {state['from']} 到 {state['to']}，時間 {text}\n"
-                    f"🚕 成功配對用戶：{match['user_id'][-5:]}\n"
+                    f"🧑‍🤝‍🧑 成功配對對象：{match['user_id'][-5:]}\n"
                     f"💰 每人預估費用：${share}"
                 )
             else:
@@ -123,17 +128,17 @@ def handle_message(event):
             reply = "⚠️ 時間格式錯誤，請重新輸入（例如：2025-06-01 18:00）："
 
     elif text.lower() in ["查詢", "查詢預約"]:
-        res = supabase.table("rides").select("*").eq("user_id", user_id).execute()
-        if res.data:
-            messages = []
-            for r in res.data:
-                m = f"{r['origin']} → {r['destination']} 時間: {r['time'][11:16]}"
+        result = supabase.table("rides").select("*").eq("user_id", user_id).execute()
+        if result.data:
+            lines = []
+            for r in result.data:
+                line = f"{r['origin']} → {r['destination']} 時間: {r['time'][11:16]}"
                 if r.get("matched_user"):
-                    m += f"\n🧑‍🤝‍🧑 共乘對象：{r['matched_user'][-5:]}"
-                    if r.get("share_fare"):
-                        m += f"\n💰 分攤金額：${r['share_fare']}"
-                messages.append(m)
-            reply = "📋 你的預約如下：\n" + "\n\n".join(messages)
+                    line += f" | 共乘對象: {r['matched_user'][-5:]}"
+                if r.get("share_fare"):
+                    line += f" | 預估費用: ${r['share_fare']}"
+                lines.append(line)
+            reply = "📋 你的預約如下：\n" + "\n".join(lines)
         else:
             reply = "你目前沒有任何預約。"
 
