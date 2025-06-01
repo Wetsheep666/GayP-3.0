@@ -6,28 +6,27 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 import os
 import datetime
-import requests
 import random
 from geopy.distance import geodesic
 
-# 載入 .env 中的環境變數
+# 載入環境變數（.env）
 load_dotenv()
 
-# 初始化 Flask、LINE Bot、Supabase 客戶端
+# 初始化 Flask、LINE Bot 和 Supabase 客戶端
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-# 暫存使用者輸入狀態的字典
+# 暫存每位使用者的輸入流程狀態
 user_states = {}
 
-# Render 健康檢查用首頁
+# 測試首頁路由
 @app.route("/", methods=["GET"])
 def home():
     return "LINE Bot is running."
 
-# 處理 LINE Webhook 請求
+# 處理來自 LINE 的 Webhook
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -47,13 +46,11 @@ def handle_location(event):
     lng = event.message.longitude
 
     if state.get("step") == "from":
-        # 儲存出發地
         state["from_lat"] = lat
         state["from_lng"] = lng
         state["step"] = "to"
         reply = "請傳送目的地位置📍"
     elif state.get("step") == "to":
-        # 儲存目的地
         state["to_lat"] = lat
         state["to_lng"] = lng
         state["step"] = "time"
@@ -72,22 +69,21 @@ def handle_text(event):
     state = user_states.get(user_id, {})
 
     if text.lower() in ["預約", "我要搭車"]:
-        # 開始預約流程
         user_states[user_id] = {"step": "from"}
         reply = "請傳送出發地位置📍"
 
     elif state.get("step") == "time":
         try:
-            # 解析時間輸入
+            # 處理使用者輸入的時間
             dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
             user_time = dt.replace(tzinfo=None)
             state["time"] = dt.isoformat()
             user_states.pop(user_id, None)
 
-            # 刪除舊資料
+            # 刪除舊預約
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
-            # 儲存新預約資料
+            # 建立新預約資料
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "from_lat": state["from_lat"],
@@ -101,7 +97,7 @@ def handle_text(event):
                 "driver_id": None
             }).execute()
 
-            # 搜尋配對對象（10分鐘內、地理距離在 500 公尺以內）
+            # 搜尋尚未配對的候選者
             candidates = supabase.table("rides") \
                 .select("*") \
                 .eq("matched_user", None) \
@@ -111,19 +107,21 @@ def handle_text(event):
             matched = None
             for r in candidates:
                 try:
-                    t = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
-                    if abs((t - user_time).total_seconds()) > 600:
+                    r_time = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
+                    time_diff = abs((r_time - user_time).total_seconds())
+                    if time_diff > 600:
                         continue
+
                     from_dist = geodesic((r["from_lat"], r["from_lng"]), (state["from_lat"], state["from_lng"])).meters
                     to_dist = geodesic((r["to_lat"], r["to_lng"]), (state["to_lat"], state["to_lng"])).meters
                     if from_dist <= 500 and to_dist <= 500:
                         matched = r
                         break
-                except:
+                except Exception as e:
                     continue
 
             if matched:
-                # 計算距離與分攤費用（每公里 50 元）
+                # 計算距離與費用
                 distance_km = geodesic(
                     (state["from_lat"], state["from_lng"]),
                     (state["to_lat"], state["to_lng"])
@@ -131,7 +129,7 @@ def handle_text(event):
                 total_fare = max(50, int(distance_km * 50))
                 share = total_fare // 2
 
-                # 從 drivers 表中隨機分配司機
+                # 隨機指派司機
                 drivers = supabase.table("drivers").select("*").execute().data
                 driver = random.choice(drivers) if drivers else None
                 driver_name = driver["name"] if driver else "N/A"
@@ -153,7 +151,13 @@ def handle_text(event):
                     "driver_id": driver_id
                 }).eq("user_id", matched["user_id"]).execute()
 
-                reply = f"✅ 預約成功！\n🧑‍🤝‍🧑 成功配對！\n🚕 共乘對象：{matched['user_id']}\n💰 總費用：${total_fare}，你需支付：${share}\n👨‍✈️ 司機：{driver_name}（{driver_phone}）"
+                reply = (
+                    f"✅ 預約成功！\n"
+                    f"🧑‍🤝‍🧑 成功配對！\n"
+                    f"🚕 共乘對象：{matched['user_id']}\n"
+                    f"💰 總費用：${total_fare}，你需支付：${share}\n"
+                    f"👨‍✈️ 司機：{driver_name}（{driver_phone}）"
+                )
             else:
                 reply = "✅ 預約成功！\n目前暫無共乘對象。"
 
@@ -179,6 +183,6 @@ def handle_text(event):
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-# 啟動應用（本地測試用）
+# 啟動 Flask 應用
 if __name__ == "__main__":
     app.run()
