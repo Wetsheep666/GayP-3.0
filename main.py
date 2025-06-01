@@ -8,15 +8,16 @@ from geopy.distance import geodesic
 import os
 import datetime
 
-# === 環境與服務初始化 ===
+# 載入 .env 設定檔
 load_dotenv()
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+# 使用者狀態暫存
 user_states = {}
 
-# === 基本首頁與 Webhook 路由 ===
 @app.route("/", methods=["GET"])
 def home():
     return "LINE Bot is running."
@@ -31,7 +32,6 @@ def callback():
         abort(400)
     return "OK"
 
-# === 接收位置訊息 ===
 @handler.add(MessageEvent, message=LocationMessage)
 def handle_location(event):
     user_id = event.source.user_id
@@ -47,7 +47,7 @@ def handle_location(event):
             "from_lng": lng,
             "step": "to"
         })
-        reply = "請傳送目的地點（左下角「+」➜ 地點 📍）"
+        reply = "📍 請傳送目的地點（左下角「+」➜ 地點）"
     elif state.get("step") == "to":
         state.update({
             "to_address": address,
@@ -55,72 +55,86 @@ def handle_location(event):
             "to_lng": lng,
             "step": "time"
         })
-        reply = "請輸入預約時間（格式：2025-06-01 18:00）："
+        reply = "🕒 請輸入預約時間（格式：2025-06-01 18:00）："
     else:
         reply = "請先輸入「預約」開始流程。"
 
     user_states[user_id] = state
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-# === 處理文字訊息 ===
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
     state = user_states.get(user_id, {})
 
-    # === 開始預約 ===
     if text in ["預約", "我要搭車"]:
         profile = supabase.table("profiles").select("*").eq("user_id", user_id).execute().data
         if not profile:
             user_states[user_id] = {"step": "name"}
-            reply = "請先輸入您的姓名："
+            reply = "👤 請先輸入您的姓名："
         else:
             user_states[user_id] = {"step": "from"}
-            reply = "請傳送出發地點（左下角「+」➜ 地點 📍）"
+            reply = "📍 請傳送出發地點（左下角「+」➜ 地點）"
 
-    # === 輸入偏好資料（永久儲存於 profiles 表）===
     elif state.get("step") == "name":
         state["name"] = text
         state["step"] = "gender"
-        reply = "請輸入性別（男/女）："
+        reply = "👫 請輸入性別（男/女）："
+
     elif state.get("step") == "gender":
         if text not in ["男", "女"]:
             reply = "⚠️ 請輸入「男」或「女」"
         else:
             state["gender"] = text
             state["step"] = "pet"
-            reply = "是否可接受共乘對象攜帶寵物？（是/否）"
+            reply = "🐶 是否會攜帶寵物？（是/否）"
+
     elif state.get("step") == "pet":
-        state["pet_friendly"] = text == "是"
+        state["has_pet"] = text == "是"
         state["step"] = "smoke"
-        reply = "是否可接受共乘對象吸菸？（是/否）"
+        reply = "🚬 是否會吸菸？（是/否）"
+
     elif state.get("step") == "smoke":
-        state["smoke_friendly"] = text == "是"
+        state["is_smoker"] = text == "是"
+        state["step"] = "accept_pet"
+        reply = "🐾 是否可接受對方攜帶寵物？（是/否）"
+
+    elif state.get("step") == "accept_pet":
+        state["accept_pet"] = text == "是"
+        state["step"] = "accept_smoke"
+        reply = "🚭 是否可接受對方吸菸？（是/否）"
+
+    elif state.get("step") == "accept_smoke":
+        state["accept_smoke"] = text == "是"
+
+        # 寫入 profiles 資料表
         supabase.table("profiles").upsert({
             "user_id": user_id,
             "name": state["name"],
             "gender": state["gender"],
-            "pet_friendly": state["pet_friendly"],
-            "smoke_friendly": state["smoke_friendly"]
+            "pet_friendly": state["accept_pet"],
+            "smoke_friendly": state["accept_smoke"],
+            "is_smoker": state["is_smoker"],
+            "has_pet": state["has_pet"]
         }).execute()
-        state["step"] = "from"
-        reply = "✅ 資料已儲存！請傳送出發地點（左下角「+」➜ 地點 📍）"
 
-    # === 預約搭車並配對 ===
+        state["step"] = "from"
+        reply = "✅ 資料已儲存，請傳送出發地點（左下角「+」➜ 地點）"
+
     elif state.get("step") == "time":
         try:
             dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
             user_time = dt.replace(tzinfo=None)
             state["time"] = dt.isoformat()
 
-            # 取得偏好資料
+            # 取得本用戶資料
             user_profile = supabase.table("profiles").select("*").eq("user_id", user_id).execute().data[0]
 
             # 清除舊預約
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
-            # 儲存新的預約
+            # 建立新預約
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "origin": state["from_address"],
@@ -135,12 +149,10 @@ def handle_text(event):
                 "share_fare": None
             }).execute()
 
-            # 嘗試配對
-            result = supabase.table("rides").select("*") \
-                .is_("matched_user", None).neq("user_id", user_id).execute().data
-
+            # 開始找共乘對象
+            candidates = supabase.table("rides").select("*").is_("matched_user", None).neq("user_id", user_id).execute().data
             match = None
-            for r in result:
+            for r in candidates:
                 try:
                     rt = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
                     if abs((user_time - rt).total_seconds()) > 600:
@@ -150,15 +162,16 @@ def handle_text(event):
                     if o_dist > 1000 or d_dist > 1000:
                         continue
 
-                    match_profile = supabase.table("profiles").select("*") \
-                        .eq("user_id", r["user_id"]).execute().data[0]
+                    other_profile = supabase.table("profiles").select("*").eq("user_id", r["user_id"]).execute().data[0]
 
-                    # 雙方皆須接受彼此偏好條件
-                    if not user_profile["pet_friendly"] and match_profile["pet_friendly"]:
+                    
+                    if not user_profile["pet_friendly"] and other_profile["has_pet"]:
                         continue
-                    if not user_profile["smoke_friendly"] and match_profile["smoke_friendly"]:
+                    if not user_profile["smoke_friendly"] and other_profile["is_smoker"]:
                         continue
-                    if user_profile["gender"] != match_profile["gender"]:
+                    if not other_profile["pet_friendly"] and user_profile["has_pet"]:
+                        continue
+                    if not other_profile["smoke_friendly"] and user_profile["is_smoker"]:
                         continue
 
                     match = r
@@ -188,33 +201,32 @@ def handle_text(event):
 
                 preview_link = f"https://www.google.com/maps/dir/?api=1&origin={state['from_lat']},{state['from_lng']}&destination={state['to_lat']},{state['to_lng']}&travelmode=driving"
 
-                notify_msg = f"✅ 成功配對！\n🧭 路線：{state['from_address']} → {state['to_address']}\n💰 費用：${fare}，你需支付 ${share}\n🗺️ 預覽路線：{preview_link}"
-                line_bot_api.push_message(match["user_id"], TextSendMessage(text=notify_msg))
-                reply = notify_msg
+                msg = f"✅ 配對成功！\n🧭 {state['from_address']} → {state['to_address']}\n💰 總費：${fare}，你需支付 ${share}\n🗺️ 預覽路線：{preview_link}"
+                line_bot_api.push_message(match["user_id"], TextSendMessage(text=msg))
+                reply = msg
             else:
-                reply = f"✅ 已預約！但目前沒有符合的共乘對象。"
+                reply = "✅ 預約成功，但目前尚無適合的共乘對象。"
 
             user_states.pop(user_id, None)
 
         except Exception as e:
-            reply = f"⚠️ 請確認時間格式正確（2025-06-01 18:00），錯誤：{e}"
+            reply = f"⚠️ 錯誤：{e}"
 
-    # === 查詢與取消 ===
     elif text in ["查詢", "查詢預約"]:
         r = supabase.table("rides").select("*").eq("user_id", user_id).execute().data
         if r:
             r = r[0]
-            reply = f"📋 你的預約：\n{r['origin']} → {r['destination']}，時間：{r['time']}\n👥 共乘對象：{r['matched_user'] or '尚未配對'}\n💰 你需支付：{r['share_fare'] or '待定'}"
+            reply = f"📋 預約資訊：\n{r['origin']} → {r['destination']}\n🕒 {r['time']}\n👥 配對對象：{r['matched_user'] or '尚未配對'}\n💰 你需支付：{r['share_fare'] or '待定'}"
         else:
-            reply = "目前沒有預約紀錄。"
+            reply = "你目前沒有預約。"
 
     elif text in ["取消", "取消預約"]:
         supabase.table("rides").delete().eq("user_id", user_id).execute()
         user_states.pop(user_id, None)
-        reply = "🗑️ 已取消你的預約。"
+        reply = "✅ 預約已取消。"
 
     else:
-        reply = "請輸入：「預約」、「查詢」、「取消」或先設定用戶偏好。"
+        reply = "請輸入：「預約」、「查詢」、「取消」來使用共乘服務。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
