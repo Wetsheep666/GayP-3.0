@@ -8,16 +8,14 @@ from geopy.distance import geodesic
 import os
 import datetime
 
-# 載入 .env 參數
+# 載入環境變數
 load_dotenv()
-
-# 初始化 Flask 與 Supabase
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-# 暫存使用者輸入
+# 使用者暫存資料（用於輸入流程）
 user_states = {}
 
 @app.route("/", methods=["GET"])
@@ -33,6 +31,8 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return "OK"
+
+# 接收位置訊息（用於出發與目的地）
 @handler.add(MessageEvent, message=LocationMessage)
 def handle_location(event):
     user_id = event.source.user_id
@@ -48,7 +48,7 @@ def handle_location(event):
             "from_lng": lng,
             "step": "to"
         })
-        reply = "📍 請傳送目的地位置（建議點左下角「+」圖示 → 傳送位置）"
+        reply = "請傳送目的地點（左下角「+」➜ 地點 📍）"
     elif state.get("step") == "to":
         state.update({
             "to_address": address,
@@ -56,53 +56,72 @@ def handle_location(event):
             "to_lng": lng,
             "step": "time"
         })
-        reply = "🕒 請輸入搭車時間（例如：2025-06-01 18:00）："
+        reply = "請輸入預約時間（格式：2025-06-01 18:00）："
     else:
-        reply = "請輸入「預約」來開始。"
+        reply = "請先輸入「預約」開始流程。"
 
     user_states[user_id] = state
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+# 處理文字訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
     state = user_states.get(user_id, {})
 
-    # 啟動預約流程
+    # === 開始預約 ===
     if text in ["預約", "我要搭車"]:
-        user_states[user_id] = {"step": "gender"}
-        reply = "請輸入您的性別（男 / 女 / 其他）："
+        # 先確認是否已填過偏好資料
+        profile = supabase.table("profiles").select("*").eq("user_id", user_id).execute().data
+        if not profile:
+            user_states[user_id] = {"step": "name"}
+            reply = "請先輸入您的姓名："
+        else:
+            user_states[user_id] = {"step": "from"}
+            reply = "請傳送出發地點（左下角「+」➜ 地點 📍）"
 
-    # 第一步：輸入性別
+    # === 輸入偏好 ===
+    elif state.get("step") == "name":
+        state["name"] = text
+        state["step"] = "gender"
+        reply = "請輸入性別（男/女）："
     elif state.get("step") == "gender":
-        state["gender"] = text
-        state["step"] = "accept_pet"
-        reply = "您是否接受共乘者攜帶寵物？（是 / 否）"
-
-    # 第二步：是否接受寵物
-    elif state.get("step") == "accept_pet":
-        state["accept_pet"] = text == "是"
-        state["step"] = "accept_smoke"
-        reply = "您是否接受共乘者吸菸？（是 / 否）"
-
-    # 第三步：是否接受吸菸
-    elif state.get("step") == "accept_smoke":
-        state["accept_smoke"] = text == "是"
+        if text not in ["男", "女"]:
+            reply = "⚠️ 請輸入「男」或「女」"
+        else:
+            state["gender"] = text
+            state["step"] = "pet"
+            reply = "是否可接受共乘對象攜帶寵物？（是/否）"
+    elif state.get("step") == "pet":
+        state["pet_friendly"] = text == "是"
+        state["step"] = "smoke"
+        reply = "是否可接受共乘對象吸菸？（是/否）"
+    elif state.get("step") == "smoke":
+        state["smoke_friendly"] = text == "是"
+        # 儲存 profiles 資料
+        supabase.table("profiles").upsert({
+            "user_id": user_id,
+            "name": state["name"],
+            "gender": state["gender"],
+            "pet_friendly": state["pet_friendly"],
+            "smoke_friendly": state["smoke_friendly"]
+        }).execute()
         state["step"] = "from"
-        reply = "請傳送出發地點（建議使用地圖 📍）"
-
-    # 時間輸入 → 儲存預約 → 嘗試配對
+        reply = "✅ 資料已儲存！請傳送出發地點（左下角「+」➜ 地點 📍）"
     elif state.get("step") == "time":
         try:
             dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
-            state["time"] = dt.isoformat()
             user_time = dt.replace(tzinfo=None)
-            user_states.pop(user_id, None)
+            state["time"] = dt.isoformat()
+
+            # 取得使用者偏好資料
+            user_profile = supabase.table("profiles").select("*").eq("user_id", user_id).execute().data[0]
 
             # 刪除舊預約
             supabase.table("rides").delete().eq("user_id", user_id).execute()
 
-            # 新增預約
+            # 儲存新預約
             supabase.table("rides").insert({
                 "user_id": user_id,
                 "origin": state["from_address"],
@@ -114,81 +133,92 @@ def handle_text(event):
                 "time": state["time"],
                 "matched_user": None,
                 "fare": None,
-                "share_fare": None,
-                "gender": state["gender"],
-                "accept_pet": state["accept_pet"],
-                "accept_smoke": state["accept_smoke"]
+                "share_fare": None
             }).execute()
 
-            # 嘗試配對
-            match = None
-            origin = (state["from_lat"], state["from_lng"])
-            destination = (state["to_lat"], state["to_lng"])
-            results = supabase.table("rides").select("*").is_("matched_user", None).neq("user_id", user_id).execute().data
+            # 尋找配對（10 分內、距離 1000 公尺內、偏好相符）
+            result = supabase.table("rides").select("*") \
+                .is_("matched_user", None).neq("user_id", user_id).execute().data
 
-            for r in results:
+            match = None
+            for r in result:
                 try:
-                    r_time = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
-                    if abs((user_time - r_time).total_seconds()) > 600:
+                    rt = datetime.datetime.fromisoformat(r["time"]).replace(tzinfo=None)
+                    if abs((user_time - rt).total_seconds()) > 600:
                         continue
-                    if geodesic(origin, (r["origin_lat"], r["origin_lng"])).meters > 1000:
+                    o_dist = geodesic((state["from_lat"], state["from_lng"]),
+                                      (r["origin_lat"], r["origin_lng"])).meters
+                    d_dist = geodesic((state["to_lat"], state["to_lng"]),
+                                      (r["destination_lat"], r["destination_lng"])).meters
+                    if o_dist > 1000 or d_dist > 1000:
                         continue
-                    if geodesic(destination, (r["destination_lat"], r["destination_lng"])).meters > 1000:
+
+                    match_profile = supabase.table("profiles").select("*") \
+                        .eq("user_id", r["user_id"]).execute().data[0]
+
+                    # 偏好篩選條件（雙方皆接受）
+                    if not user_profile["pet_friendly"] and match_profile["pet_friendly"]:
                         continue
+                    if not user_profile["smoke_friendly"] and match_profile["smoke_friendly"]:
+                        continue
+                    if user_profile["gender"] != match_profile["gender"]:
+                        continue
+
                     match = r
                     break
-                except:
+                except Exception as e:
+                    print("配對錯誤：", e)
                     continue
 
             if match:
-                # 計算價格
-                km = geodesic(origin, destination).km
-                fare = max(50, int(km * 50))
+                distance_km = geodesic(
+                    (state["from_lat"], state["from_lng"]),
+                    (state["to_lat"], state["to_lng"])
+                ).km
+                fare = max(50, int(distance_km * 50))
                 share = fare // 2
 
-                # 更新雙方資料
+                # 更新雙方
                 supabase.table("rides").update({
                     "matched_user": match["user_id"],
                     "fare": fare,
                     "share_fare": share
                 }).eq("user_id", user_id).execute()
-
                 supabase.table("rides").update({
                     "matched_user": user_id,
                     "fare": fare,
                     "share_fare": share
                 }).eq("user_id", match["user_id"]).execute()
 
-                # 預覽連結
-                preview = f"https://www.google.com/maps/dir/?api=1&origin={state['from_lat']},{state['from_lng']}&destination={state['to_lat']},{state['to_lng']}&travelmode=driving"
+                preview_link = f"https://www.google.com/maps/dir/?api=1&origin={state['from_lat']},{state['from_lng']}&destination={state['to_lat']},{state['to_lng']}&travelmode=driving"
 
-                # 推送通知給對方
-                line_bot_api.push_message(match["user_id"], TextSendMessage(
-                    text=f"✅ 已與 {user_id} 配對成功！\n🧭 {match['origin']} → {match['destination']}\n💰 你需支付：${share}\n🗺️ 路線預覽：{preview}"
-                ))
-
-                reply = f"✅ 預約與配對成功！\n🧭 {state['from_address']} → {state['to_address']}\n💰 你需支付：${share}\n🗺️ 預覽路線：{preview}"
+                # 發送雙方通知
+                notify_msg = f"✅ 成功配對！\n🧭 路線：{state['from_address']} → {state['to_address']}\n💰 費用：${fare}，你需支付 ${share}\n🗺️ 預覽路線：{preview_link}"
+                line_bot_api.push_message(match["user_id"], TextSendMessage(text=notify_msg))
+                reply = notify_msg
             else:
-                reply = f"✅ 預約成功，但尚無符合條件的共乘對象。"
+                reply = f"✅ 已預約！但目前沒有符合的共乘對象。"
+
+            user_states.pop(user_id, None)
 
         except Exception as e:
-            reply = f"⚠️ 請輸入正確時間格式（例如：2025-06-01 18:00）"
+            reply = f"⚠️ 請確認格式正確（2025-06-01 18:00），錯誤：{e}"
 
     elif text in ["查詢", "查詢預約"]:
-        result = supabase.table("rides").select("*").eq("user_id", user_id).execute().data
-        if result:
-            r = result[0]
-            reply = f"📋 預約資訊：\n出發：{r['origin']}\n目的：{r['destination']}\n時間：{r['time']}\n共乘對象：{r.get('matched_user') or '無'}\n💰 分攤費用：${r.get('share_fare') or '？'}"
+        r = supabase.table("rides").select("*").eq("user_id", user_id).execute().data
+        if r:
+            r = r[0]
+            reply = f"📋 你的預約：\n{r['origin']} → {r['destination']}，時間：{r['time']}\n👥 共乘對象：{r['matched_user'] or '尚未配對'}\n💰 你需支付：{r['share_fare'] or '待定'}"
         else:
-            reply = "目前沒有預約資訊。"
+            reply = "目前沒有預約紀錄。"
 
     elif text in ["取消", "取消預約"]:
         supabase.table("rides").delete().eq("user_id", user_id).execute()
         user_states.pop(user_id, None)
-        reply = "✅ 預約已取消。"
+        reply = "🗑️ 已取消你的預約。"
 
     else:
-        reply = "請輸入「預約」、「查詢」、「取消」來開始使用共乘服務。"
+        reply = "請輸入：「預約」、「查詢」、「取消」或「用戶資訊」來使用共乘服務。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
