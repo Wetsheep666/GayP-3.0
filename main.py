@@ -88,7 +88,7 @@ def handle_text(event):
         else:
             state["gender"] = text
             state["step"] = "phone"
-            reply = "📞 請輸入聯絡電話（僅共乘對象會看到）："
+            reply = "📞 請輸入聯絡電話（供司機配對與共乘對象確認）："
 
     elif state.get("step") == "phone":
         state["phone"] = text
