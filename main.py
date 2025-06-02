@@ -160,8 +160,7 @@ def handle_text(event):
                         continue
 
                     other_profile = supabase.table("profiles").select("*").eq("user_id", r["user_id"]).execute().data[0]
-                    if user_profile["gender"] != other_profile["gender"]:
-                        continue
+                    
                     if not user_profile["pet_friendly"] and other_profile["has_pet"]:
                         continue
                     if not user_profile["smoke_friendly"] and other_profile["is_smoker"]:
